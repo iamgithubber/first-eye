@@ -30,7 +30,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 import json
 import shutil
@@ -391,7 +391,7 @@ def check_authorization(target: str, auth_file: Path | None, confirm_owned: bool
 
 def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool, concurrency: int, confirm_owned: bool, auth_file: Path | None, export_llm: bool):
     logger.info("Starting reconciliation run for %s", target)
-    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     run_out = outdir / run_id
     if not dry_run:
         run_out.mkdir(parents=True, exist_ok=True)
@@ -400,7 +400,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     run_meta = {
         "target": target,
         "run_id": run_id,
-        "started_at": datetime.utcnow().isoformat() + "Z",
+        "started_at": datetime.now(UTC).isoformat(),
         "fast": fast,
         "deep": deep,
         "tools_checked": {},
@@ -421,7 +421,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     stop_event = threading.Event()
     def status_updater():
         while not stop_event.is_set():
-            logger.info("Recon is still running... (%s)", datetime.utcnow().strftime("%H:%M:%S"))
+            logger.info("Recon is still running... (%s)", datetime.now(UTC).strftime("%H:%M:%S"))
             stop_event.wait(20)
     status_thread = threading.Thread(target=status_updater, daemon=True)
     status_thread.start()
@@ -440,7 +440,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
         if deep:
             step_deep_extra(outdir=run_out, dry_run=dry_run)
         # write run_meta
-        run_meta["finished_at"] = datetime.utcnow().isoformat() + "Z"
+        run_meta["finished_at"] = datetime.now(UTC).isoformat()
         if not dry_run:
             (run_out / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
             logger.info("Run meta written to %s", run_out / "run_meta.json")

@@ -1,0 +1,4 @@
+# Python requirements for ai-recon
+# Add more as needed
+paramspider
+arjun
