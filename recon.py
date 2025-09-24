@@ -197,7 +197,7 @@ def step_resolve_dnsx(indir: Path, outdir: Path, dry_run: bool, concurrency: int
     if not subs_file.exists():
         logger.warning("No subdomain list found at %s; skipping dnsx", subs_file)
         return
-    cmd = f"cat {subs_file} | {TOOLS['dnsx']} -silent -a -resp -o {out_file}"
+    cmd = f"cat {subs_file} | {TOOLS['dnsx']} -silent -resp-only -o {out_file}"
     rc = safe_run(cmd, dry_run=dry_run)
     if rc == 0:
         logger.info("dnsx completed and wrote %s", out_file)
