@@ -28,6 +28,8 @@ import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 import json
@@ -382,6 +384,7 @@ def check_authorization(target: str, auth_file: Path | None, confirm_owned: bool
     return False
 
 
+
 # ---------------------------
 # Main orchestration
 # ---------------------------
@@ -414,6 +417,15 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     run_meta["tools_checked"] = tool_avail
     logger.info("Tool availability: %s", {k: ("yes" if v else "no") for k, v in tool_avail.items()})
 
+    # --- Periodic status update thread ---
+    stop_event = threading.Event()
+    def status_updater():
+        while not stop_event.is_set():
+            logger.info("Recon is still running... (%s)", datetime.utcnow().strftime("%H:%M:%S"))
+            stop_event.wait(20)
+    status_thread = threading.Thread(target=status_updater, daemon=True)
+    status_thread.start()
+
     # Steps
     try:
         step_subdomain_passive(target=target, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
@@ -445,6 +457,8 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     except Exception:
         logger.exception("Unexpected error during orchestration")
     finally:
+        stop_event.set()
+        status_thread.join(timeout=1)
         logger.info("Run completed. Outputs (if any) are in: %s", run_out)
 
 
