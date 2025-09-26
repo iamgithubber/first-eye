@@ -1,8 +1,14 @@
 
 
+
 # ai-recon
 
 An automated reconnaissance framework that integrates the best open-source recon tools with a Python orchestration layer and LLM-ready structured output. The goal: fast, repeatable recon with AI-powered analysis.
+
+## Recent Updates
+- **[2025-09-26]**: Improved subdomain aggregation in `export_to_json.py` (merges subfinder, assetfinder, and subs_unique.txt for robust reporting)
+- Added `CHANGELOG.md` to track all notable changes
+- Exported JSON report now always includes all available findings
 
 🚀 **Features**
 
@@ -59,9 +65,16 @@ Manually install required tools or let the Docker container handle it:
 
 ⚡ Tip: For reproducibility, use the Docker build.
 
+
 🛠 **Usage**
 
+
 Run Recon
+```sh
+python3 main.py
+```
+
+Or use the orchestrator directly:
 ```sh
 python3 recon.py -d example.com -o output.json
 ```
@@ -74,6 +87,7 @@ python3 recon.py -d example.com -o output.json
 ```sh
 python3 recon.py -d hackerone.com -o reports/h1.json
 ```
+
 
 🤖 **LLM Post-Processing**
 
@@ -90,16 +104,22 @@ Task:
 Output: JSON {summary, interesting_urls, high_priority_hosts}
 ```
 
+
 📊 **Roadmap**
 - Add chunking for large inputs (LLM handling)
 - CI/CD with GitHub Actions
 - Automated HTML/PDF report generator
 - Multi-target batch mode
 
+
+📄 **Changelog**
+See `CHANGELOG.md` for a list of all notable changes and release notes.
+
 ⚠️ **Legal Disclaimer**
 
 This tool is for educational and authorized security testing only.
 Do not use against systems without explicit written permission.
 The authors take no responsibility for misuse.
+
 
 ✨ Happy Hacking & Recon!
