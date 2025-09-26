@@ -22,9 +22,17 @@ def main():
     args = parser.parse_args()
 
     indir = Path(args.indir)
+    # Aggregate subdomains from all available sources
+    subs_unique = read_file_lines(indir / "subs_unique.txt")
+    if not subs_unique:
+        # Fallback: merge from assetfinder.txt and subfinder.txt
+        assetfinder = read_file_lines(indir / "assetfinder.txt")
+        subfinder = read_file_lines(indir / "subfinder.txt")
+        subs_set = set(assetfinder) | set(subfinder)
+        subs_unique = sorted(subs_set)
     output = {
         "target": args.target,
-        "subdomains": read_file_lines(indir / "subs_unique.txt"),
+        "subdomains": subs_unique,
         "dns_info": (indir / "dnsrecon.txt").read_text(encoding="utf-8", errors="ignore") if (indir / "dnsrecon.txt").exists() else "",
         "httpx": read_file_lines(indir / "httpx.txt"),
         "naabu": read_file_lines(indir / "naabu.txt"),
