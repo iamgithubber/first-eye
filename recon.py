@@ -186,36 +186,72 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
         logger.info("[dry-run] would combine outputs into %s", subs_unique)
 
 
-def step_resolve_dnsx(indir: Path, outdir: Path, dry_run: bool, concurrency: int):
-    """Resolve subs_unique.txt using dnsx and write dnsx.txt with lines host ip"""
-    logger.info("Step: DNS resolution using dnsx")
+def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency: int):
+    """Resolve subs_unique.txt using dnsrecon and write dnsrecon.txt with DNS info."""
+    logger.info("Step: DNS resolution using dnsrecon")
     subs_file = indir / "subs_unique.txt" if (indir / "subs_unique.txt").exists() else indir / "subs_raw_combined.txt"
-    out_file = outdir / "dnsx.txt"
-    if not which(TOOLS["dnsx"]):
-        logger.warning("dnsx not found; skipping DNS resolution")
-        return
+    out_file = outdir / "dnsrecon.txt"
     if not subs_file.exists():
-        logger.warning("No subdomain list found at %s; skipping dnsx", subs_file)
+        logger.warning("No subdomain list found at %s; skipping dnsrecon", subs_file)
         return
-    cmd = f"cat {subs_file} | {TOOLS['dnsx']} -silent -resp-only -o {out_file}"
-    rc = safe_run(cmd, dry_run=dry_run)
-    if rc == 0:
-        logger.info("dnsx completed and wrote %s", out_file)
+    with subs_file.open("r") as f:
+        domains = [line.strip() for line in f if line.strip()]
+    if not domains:
+        logger.warning("No domains to resolve in %s; skipping dnsrecon", subs_file)
+        return
+    results = []
+    for domain in domains:
+        cmd = f"dnsrecon -d {shlex.quote(domain)} -t std"
+        logger.info(f"[dnsrecon] Resolving: {domain}")
+        if dry_run:
+            logger.info("[dry-run] %s", cmd)
+            continue
+        try:
+            proc = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode == 0:
+                results.append(proc.stdout.decode("utf-8", errors="ignore"))
+            else:
+                logger.warning("dnsrecon failed for %s: %s", domain, proc.stderr.decode("utf-8", errors="ignore"))
+        except Exception as exc:
+            logger.exception("Error running dnsrecon for %s: %s", domain, exc)
+    if not dry_run:
+        with out_file.open("w", encoding="utf-8") as f:
+            for res in results:
+                f.write(res + "\n")
+        logger.info("dnsrecon completed and wrote %s", out_file)
     else:
-        logger.warning("dnsx returned exit code %s", rc)
+        logger.info("[dry-run] would write dnsrecon output to %s", out_file)
 
 
 def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
     """Run httpx against resolved hosts or subs_unique to probe HTTP endpoints."""
     logger.info("Step: HTTP probing using httpx")
-    dnsx_file = outdir / "dnsx.txt"
+    dnsrecon_file = outdir / "dnsrecon.txt"
     subs_file = outdir / "subs_unique.txt"
     httpx_out_txt = outdir / "httpx.txt"
     httpx_out_json = outdir / "httpx.json"
     if not which(TOOLS["httpx"]):
         logger.warning("httpx not found; skipping httpx")
         return
-    src = dnsx_file if dnsx_file.exists() else subs_file
+    # Extract hostnames from dnsrecon.txt if it exists, else use subs_unique.txt
+    if dnsrecon_file.exists():
+        hosts = set()
+        with dnsrecon_file.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip() and ("A " in line or "CNAME " in line):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        hosts.add(parts[1])
+        if not hosts:
+            logger.warning("No hosts found in dnsrecon.txt; falling back to subs_unique.txt")
+            src = subs_file
+        else:
+            # Write hosts to a temp file for httpx input
+            temp_hosts = outdir / "hosts_for_httpx.txt"
+            temp_hosts.write_text("\n".join(hosts), encoding="utf-8")
+            src = temp_hosts
+    else:
+        src = subs_file
     if not src.exists():
         logger.warning("No source for httpx found (%s); skipping", src)
         return
@@ -231,24 +267,24 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
 
 
 def step_naabu(outdir: Path, dry_run: bool, concurrency: int, rate: int = 1000):
-    """Quick port scan using naabu on hosts/IPs found in dnsx.txt (fast mode)."""
+    """Quick port scan using naabu on hosts/IPs found in dnsrecon.txt (fast mode)."""
     logger.info("Step: quick port enumeration using naabu")
-    dnsx_file = outdir / "dnsx.txt"
+    dnsrecon_file = outdir / "dnsrecon.txt"
     naabu_out = outdir / "naabu.txt"
     if not which(TOOLS["naabu"]):
         logger.warning("naabu not found; skipping naabu")
         return
-    if not dnsx_file.exists():
-        logger.warning("dnsx output missing; skipping naabu")
+    if not dnsrecon_file.exists():
+        logger.warning("dnsrecon output missing; skipping naabu")
         return
     # extract IPs (best-effort: tokens that look like IPs)
     ips = set()
-    for ln in dnsx_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for ln in dnsrecon_file.read_text(encoding="utf-8", errors="ignore").splitlines():
         for token in ln.split():
             if token.count(".") == 3:
                 ips.add(token.strip(","))
     if not ips:
-        logger.warning("No IPs found in dnsx output; skipping naabu")
+        logger.warning("No IPs found in dnsrecon output; skipping naabu")
         return
     ips_list_file = outdir / "ips_for_naabu.txt"
     ips_list_file.write_text("\n".join(sorted(ips)), encoding="utf-8")
@@ -429,7 +465,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     # Steps
     try:
         step_subdomain_passive(target=target, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        step_resolve_dnsx(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+        step_resolve_dnsrecon(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
         step_httpx(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
         step_naabu(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
         # optional wayback
