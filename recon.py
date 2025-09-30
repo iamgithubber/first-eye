@@ -152,18 +152,21 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
 
     # subfinder
     if which(TOOLS["subfinder"]):
+        logger.info("[subfinder] Starting: %s", f"{TOOLS['subfinder']} -d {target} -silent -o {sf_out}")
         tasks.append((f"{TOOLS['subfinder']} -d {shlex.quote(target)} -silent -o {shlex.quote(str(sf_out))}", sf_out))
     else:
         logger.warning("subfinder binary not found; skipping subfinder step")
 
     # assetfinder
     if which(TOOLS["assetfinder"]):
+        logger.info("[assetfinder] Starting: %s", f"{TOOLS['assetfinder']} --subs-only {target} > {af_out}")
         tasks.append((f"{TOOLS['assetfinder']} --subs-only {shlex.quote(target)} > {shlex.quote(str(af_out))}", af_out))
     else:
         logger.warning("assetfinder binary not found; skipping assetfinder step")
 
     # amass passive
     if which(TOOLS["amass"]):
+        logger.info("[amass] Starting: %s", f"{TOOLS['amass']} enum -passive -d {target} -o {amass_out}")
         tasks.append((f"{TOOLS['amass']} enum -passive -d {shlex.quote(target)} -o {shlex.quote(str(amass_out))}", amass_out))
     else:
         logger.warning("amass binary not found; skipping amass passive step")
@@ -172,10 +175,13 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
     if tasks:
         with ThreadPoolExecutor(max_workers=min(len(tasks), max(1, concurrency))) as ex:
             futures = [ex.submit(safe_run, cmd, None, out, dry_run) for cmd, out in tasks]
-            for f in as_completed(futures):
+            for i, f in enumerate(as_completed(futures)):
                 ret = f.result()
-                if ret != 0:
-                    logger.debug("Passive task returned code %s", ret)
+                step_name = tasks[i][0].split()[0] if i < len(tasks) else "unknown"
+                if ret == 0:
+                    logger.info("[%s] Finished successfully.", step_name)
+                else:
+                    logger.warning("[%s] Failed with code %s", step_name, ret)
 
     # combine into subs_unique.txt
     combined = outdir / "subs_raw_combined.txt"
@@ -250,7 +256,7 @@ def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency:
     if dry_run:
         logger.info("[dry-run] would run dnsrecon for %d domains", len(domains))
     else:
-        # run dnsrecon in parallel for domains (bounded by concurrency)
+        logger.info("[dnsrecon] Starting DNS resolution for %d domains", len(domains))
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
             futures = {ex.submit(_run_dnsrecon_for_domain, d): d for d in domains}
             for fut in as_completed(futures):
@@ -258,11 +264,12 @@ def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency:
                 try:
                     d, rc, out = fut.result()
                     if rc == 0:
+                        logger.info("[dnsrecon] Success for %s", d)
                         results.append(out)
                     else:
-                        logger.warning("dnsrecon failed for %s (rc=%s): %s", d, rc, out.strip().splitlines()[0] if out else "(no output)")
+                        logger.warning("[dnsrecon] Failed for %s (rc=%s): %s", d, rc, out.strip().splitlines()[0] if out else "(no output)")
                 except Exception as exc:
-                    logger.exception("dnsrecon exception for %s: %s", domain, exc)
+                    logger.exception("[dnsrecon] Exception for %s: %s", domain, exc)
 
     if not dry_run:
         try:
@@ -317,13 +324,15 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
         return
     # prefer json output if available
     cmd = f"cat {shlex.quote(str(src))} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -json -o {shlex.quote(str(httpx_out_json))}"
+    logger.info("[httpx] Starting HTTP probing: %s", cmd)
     rc = safe_run(cmd, dry_run=dry_run)
     if rc != 0:
-        logger.info("httpx json path failed or not supported; falling back to text output")
+        logger.warning("[httpx] JSON output failed; falling back to text output")
         cmd2 = f"cat {shlex.quote(str(src))} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -o {shlex.quote(str(httpx_out_txt))}"
+        logger.info("[httpx] Running fallback: %s", cmd2)
         safe_run(cmd2, dry_run=dry_run)
     else:
-        logger.info("httpx json output written to %s", httpx_out_json)
+        logger.info("[httpx] JSON output written to %s", httpx_out_json)
 
 
 def step_naabu(outdir: Path, dry_run: bool, concurrency: int, rate: int = 1000):
@@ -354,11 +363,12 @@ def step_naabu(outdir: Path, dry_run: bool, concurrency: int, rate: int = 1000):
     ips_list_file = outdir / "ips_for_naabu.txt"
     ips_list_file.write_text("\n".join(sorted(ips)), encoding="utf-8")
     cmd = f"cat {shlex.quote(str(ips_list_file))} | {TOOLS['naabu']} -silent -rate {rate} -o {shlex.quote(str(naabu_out))}"
+    logger.info("[naabu] Starting port scan: %s", cmd)
     rc = safe_run(cmd, dry_run=dry_run)
     if rc == 0:
-        logger.info("naabu output written to %s", naabu_out)
+        logger.info("[naabu] Output written to %s", naabu_out)
     else:
-        logger.warning("naabu returned exit code %s", rc)
+        logger.warning("[naabu] Returned exit code %s", rc)
 
 
 def step_nuclei(outdir: Path, dry_run: bool, concurrency: int, templates: str | None = None):
@@ -386,11 +396,12 @@ def step_nuclei(outdir: Path, dry_run: bool, concurrency: int, templates: str | 
         return
     if templates:
         cmd += f" -t {shlex.quote(templates)}"
+    logger.info("[nuclei] Starting scan: %s", cmd)
     rc = safe_run(cmd, dry_run=dry_run)
     if rc == 0:
-        logger.info("nuclei results written to %s", nuclei_out)
+        logger.info("[nuclei] Results written to %s", nuclei_out)
     else:
-        logger.warning("nuclei returned exit code %s", rc)
+        logger.warning("[nuclei] Returned exit code %s", rc)
 
 
 def step_wayback(outdir: Path, dry_run: bool):
@@ -402,9 +413,11 @@ def step_wayback(outdir: Path, dry_run: bool):
     if subs_file.exists():
         if which(TOOLS["waybackurls"]):
             cmd = f"cat {shlex.quote(str(subs_file))} | {TOOLS['waybackurls']} > {shlex.quote(str(wb_out))}"
+            logger.info("[waybackurls] Starting: %s", cmd)
             safe_run(cmd, dry_run=dry_run)
         if which(TOOLS["gau"]):
             cmd2 = f"cat {shlex.quote(str(subs_file))} | {TOOLS['gau']} > {shlex.quote(str(gau_out))}"
+            logger.info("[gau] Starting: %s", cmd2)
             safe_run(cmd2, dry_run=dry_run)
     else:
         logger.warning("subs_unique.txt missing; skipping wayback/gau")
@@ -421,15 +434,18 @@ def step_deep_extra(outdir: Path, dry_run: bool):
     if which(TOOLS["hakrawler"]):
         hak_out = outdir / "hakrawler.txt"
         cmd = f"cat {shlex.quote(str(subs_file))} | xargs -n1 -P5 -I{{}} {TOOLS['hakrawler']} -u https://{{}} -plain >> {shlex.quote(str(hak_out))}"
+        logger.info("[hakrawler] Starting: %s", cmd)
         safe_run(cmd, dry_run=dry_run)
     if which(TOOLS["katana"]):
         kat_out = outdir / "katana.txt"
         cmd = f"cat {shlex.quote(str(subs_file))} | xargs -n1 -P2 -I{{}} {TOOLS['katana']} -u https://{{}} -o {shlex.quote(str(kat_out))}"
+        logger.info("[katana] Starting: %s", cmd)
         safe_run(cmd, dry_run=dry_run)
     # paramspider (example)
     if which(TOOLS["paramspider"]):
         para_out = outdir / "paramspider.txt"
         cmd = f"python3 {shlex.quote(TOOLS['paramspider'])} -d {shlex.quote(outdir.name)} -o {shlex.quote(str(para_out))}"
+        logger.info("[paramspider] Starting: %s", cmd)
         safe_run(cmd, dry_run=dry_run)
 
 
