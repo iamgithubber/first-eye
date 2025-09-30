@@ -145,43 +145,67 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
         subs_unique.write_text(cachefile.read_text(encoding="utf-8"), encoding="utf-8")
         return
 
-    tasks: list[tuple[str, Path]] = []
+    import subprocess
     sf_out = outdir / "subfinder.txt"
     af_out = outdir / "assetfinder.txt"
     amass_out = outdir / "amass_passive.txt"
-
-    # subfinder
+    tasks = []
     if which(TOOLS["subfinder"]):
-        logger.info("[subfinder] Starting: %s", f"{TOOLS['subfinder']} -d {target} -silent -o {sf_out}")
         tasks.append((f"{TOOLS['subfinder']} -d {shlex.quote(target)} -silent -o {shlex.quote(str(sf_out))}", sf_out))
-    else:
-        logger.warning("subfinder binary not found; skipping subfinder step")
-
-    # assetfinder
     if which(TOOLS["assetfinder"]):
-        logger.info("[assetfinder] Starting: %s", f"{TOOLS['assetfinder']} --subs-only {target} > {af_out}")
         tasks.append((f"{TOOLS['assetfinder']} --subs-only {shlex.quote(target)} > {shlex.quote(str(af_out))}", af_out))
-    else:
-        logger.warning("assetfinder binary not found; skipping assetfinder step")
-
-    # amass passive
-    if which(TOOLS["amass"]):
+    # amass watcher as a function
+    def run_amass_watcher():
+        if not which(TOOLS["amass"]):
+            logger.warning("amass binary not found; skipping amass passive step")
+            return 127
         logger.info("[amass] Starting: %s", f"{TOOLS['amass']} enum -passive -d {target} -o {amass_out}")
-        tasks.append((f"{TOOLS['amass']} enum -passive -d {shlex.quote(target)} -o {shlex.quote(str(amass_out))}", amass_out))
-    else:
-        logger.warning("amass binary not found; skipping amass passive step")
-
-    # Execute tasks in parallel (bounded)
-    if tasks:
-        with ThreadPoolExecutor(max_workers=min(len(tasks), max(1, concurrency))) as ex:
-            futures = [ex.submit(safe_run, cmd, None, out, dry_run) for cmd, out in tasks]
-            for i, f in enumerate(as_completed(futures)):
-                ret = f.result()
-                step_name = tasks[i][0].split()[0] if i < len(tasks) else "unknown"
-                if ret == 0:
-                    logger.info("[%s] Finished successfully.", step_name)
-                else:
-                    logger.warning("[%s] Failed with code %s", step_name, ret)
+        cmd = [TOOLS['amass'], 'enum', '-passive', '-d', target, '-o', str(amass_out)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        last_size = 0
+        last_change = time.time()
+        max_wait = 1200  # 20 minutes
+        check_interval = 30
+        while True:
+            time.sleep(check_interval)
+            if amass_out.exists():
+                size = amass_out.stat().st_size
+                if size > last_size:
+                    last_size = size
+                    last_change = time.time()
+            if time.time() - last_change > max_wait:
+                logger.warning("[amass] Output stalled for 20 minutes. Terminating and moving to next phase.")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+                break
+            if proc.poll() is not None:
+                break
+        ret = proc.returncode if proc.returncode is not None else 1
+        if ret == 0:
+            logger.info("[amass] Finished successfully.")
+        else:
+            logger.warning("[amass] Failed with code %s", ret)
+        return ret
+    # Run all in parallel
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = []
+        for cmd, out in tasks:
+            logger.info(f"[Passive] Starting: {cmd}")
+            futures.append(ex.submit(safe_run, cmd, None, out, dry_run))
+        futures.append(ex.submit(run_amass_watcher))
+        for i, f in enumerate(as_completed(futures)):
+            ret = f.result()
+            if i < len(tasks):
+                step_name = tasks[i][0].split()[0]
+            else:
+                step_name = "amass"
+            if ret == 0:
+                logger.info(f"[{step_name}] Finished successfully.")
+            else:
+                logger.warning(f"[{step_name}] Failed with code {ret}")
 
     # combine into subs_unique.txt
     combined = outdir / "subs_raw_combined.txt"
