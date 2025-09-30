@@ -1,11 +1,13 @@
-
-
-
 # ai-recon
 
 An automated reconnaissance framework that integrates the best open-source recon tools with a Python orchestration layer and LLM-ready structured output. The goal: fast, repeatable recon with AI-powered analysis.
 
 ## Recent Updates
+- **[2025-09-30]**: Amass step now monitors output file and terminates if no new results for 20 minutes, moving to next phase automatically.
+- Added verbose progress messages for all recon steps.
+- Fixed import order for Python 3.13 compatibility.
+- Added caching for passive subdomain enumeration.
+- Improved parallel execution for faster results.
 - **[2025-09-26]**: Improved subdomain aggregation in `export_to_json.py` (merges subfinder, assetfinder, and subs_unique.txt for robust reporting)
 - Added `CHANGELOG.md` to track all notable changes
 - Exported JSON report now always includes all available findings
