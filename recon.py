@@ -1,13 +1,15 @@
+
+from __future__ import annotations
 # ---------------------------
 # Cache helpers
 # ---------------------------
 def cache_dir(target: str, outdir: Path) -> Path:
-    """Return the cache directory for a given target."""
-    return outdir / "cache" / target.replace('.', '_')
+        """Return the cache directory for a given target."""
+        return outdir / "cache" / target.replace('.', '_')
 
 def cache_path(target: str, outdir: Path, step: str) -> Path:
-    """Return the cache file path for a given step."""
-    return cache_dir(target, outdir) / f"{step}.txt"
+        """Return the cache file path for a given step."""
+        return cache_dir(target, outdir) / f"{step}.txt"
 #!/usr/bin/env python3
 """
 recon.py - Python recon orchestrator (multithreaded refactor)
@@ -18,14 +20,13 @@ concurrency between independent pipeline steps and within DNS resolution.
 Key changes:
  - DNS resolution (`dnsrecon`) is parallelized using ThreadPoolExecutor.
  - Independent heavy steps (naabu, nuclei, wayback, deep extras) are run
-   in parallel after httpx finishes, with a bounded ThreadPoolExecutor.
+     in parallel after httpx finishes, with a bounded ThreadPoolExecutor.
  - Preserves safety checks, dry-run behavior, and existing command shapes.
  - Improves logging and error handling.
 
 Usage remains the same as original.
 """
 
-from __future__ import annotations
 import argparse
 import logging
 import os
