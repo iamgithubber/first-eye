@@ -1,23 +1,28 @@
+# ---------------------------
+# Cache helpers
+# ---------------------------
+def cache_dir(target: str, outdir: Path) -> Path:
+    """Return the cache directory for a given target."""
+    return outdir / "cache" / target.replace('.', '_')
+
+def cache_path(target: str, outdir: Path, step: str) -> Path:
+    """Return the cache file path for a given step."""
+    return cache_dir(target, outdir) / f"{step}.txt"
 #!/usr/bin/env python3
 """
-recon.py - Python recon orchestrator
+recon.py - Python recon orchestrator (multithreaded refactor)
 
-Replaces recon.sh with a modular Python orchestration script.
+This is a refactor of the original recon.py to add safe, bounded
+concurrency between independent pipeline steps and within DNS resolution.
 
-Usage examples:
-    python3 recon.py --target example.com --outdir outputs --fast --confirm-owned
-    python3 recon.py --target example.com --outdir outputs --deep --confirm-owned --export-llm
+Key changes:
+ - DNS resolution (`dnsrecon`) is parallelized using ThreadPoolExecutor.
+ - Independent heavy steps (naabu, nuclei, wayback, deep extras) are run
+   in parallel after httpx finishes, with a bounded ThreadPoolExecutor.
+ - Preserves safety checks, dry-run behavior, and existing command shapes.
+ - Improves logging and error handling.
 
-Important safety:
- - By default this script will refuse to run deep/aggressive scans unless environment
-   variable I_HAVE_AUTH=1 is set (or --confirm-owned is passed).
- - You can provide an AUTH_TARGETS file (one domain per line). If provided, the target
-   must be listed there unless --confirm-owned is specified.
-
-Outputs:
- - outputs/<run_id>/subfinder.txt, amass_passive.txt, assetfinder.txt, subs_unique.txt, dnsx.txt,
-   httpx.txt (or httpx.json), naabu.txt, nuclei.txt, waybackurls.txt, run_meta.json, and optionally
-   report_input.json (if export_to_json.py is present and --export-llm is used).
+Usage remains the same as original.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import shutil
@@ -103,10 +108,9 @@ def safe_run(cmd: str, cwd: Path | None = None, out_path: Path | None = None, dr
         return 0
     try:
         if out_path:
-            # ensure parent exists
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with out_path.open("wb") as fh:
-                proc = subprocess.run(shlex.split(cmd), stdout=fh, stderr=subprocess.PIPE)
+                proc = subprocess.run(shlex.split(cmd), stdout=fh, stderr=subprocess.PIPE, cwd=cwd)
                 if proc.returncode != 0:
                     logger.debug("Command stderr: %s", proc.stderr.decode(errors="ignore"))
                 return proc.returncode
@@ -128,39 +132,49 @@ def safe_run(cmd: str, cwd: Path | None = None, out_path: Path | None = None, dr
 # ---------------------------
 
 
-def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency: int):
+def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency: int, use_cache: bool = False, refresh_cache: bool = False):
     """Run subfinder, assetfinder, amass (passive) and combine outputs."""
     logger.info("Step: passive subdomain enumeration for %s", target)
-    tasks = []
+    cachefile = cache_path(target, outdir, "subs_unique")
+    if use_cache and cachefile.exists() and not refresh_cache:
+        logger.info("[cache] Using cached subdomain results from %s", cachefile)
+        # Copy cache to output location
+        subs_unique = outdir / "subs_unique.txt"
+        subs_unique.parent.mkdir(parents=True, exist_ok=True)
+        subs_unique.write_text(cachefile.read_text(encoding="utf-8"), encoding="utf-8")
+        return
+
+    tasks: list[tuple[str, Path]] = []
     sf_out = outdir / "subfinder.txt"
     af_out = outdir / "assetfinder.txt"
     amass_out = outdir / "amass_passive.txt"
 
     # subfinder
     if which(TOOLS["subfinder"]):
-        tasks.append((f"{TOOLS['subfinder']} -d {target} -silent -o {sf_out}", sf_out))
+        tasks.append((f"{TOOLS['subfinder']} -d {shlex.quote(target)} -silent -o {shlex.quote(str(sf_out))}", sf_out))
     else:
         logger.warning("subfinder binary not found; skipping subfinder step")
 
     # assetfinder
     if which(TOOLS["assetfinder"]):
-        tasks.append((f"{TOOLS['assetfinder']} --subs-only {target} > {af_out}", af_out))
+        tasks.append((f"{TOOLS['assetfinder']} --subs-only {shlex.quote(target)} > {shlex.quote(str(af_out))}", af_out))
     else:
         logger.warning("assetfinder binary not found; skipping assetfinder step")
 
     # amass passive
     if which(TOOLS["amass"]):
-        tasks.append((f"{TOOLS['amass']} enum -passive -d {target} -o {amass_out}", amass_out))
+        tasks.append((f"{TOOLS['amass']} enum -passive -d {shlex.quote(target)} -o {shlex.quote(str(amass_out))}", amass_out))
     else:
         logger.warning("amass binary not found; skipping amass passive step")
 
     # Execute tasks in parallel (bounded)
-    with ThreadPoolExecutor(max_workers=min(len(tasks) or 1, concurrency)) as ex:
-        futures = [ex.submit(safe_run, cmd, None, out, dry_run) for cmd, out in tasks]
-        for f in as_completed(futures):
-            ret = f.result()
-            if ret != 0:
-                logger.debug("Passive task returned code %s", ret)
+    if tasks:
+        with ThreadPoolExecutor(max_workers=min(len(tasks), max(1, concurrency))) as ex:
+            futures = [ex.submit(safe_run, cmd, None, out, dry_run) for cmd, out in tasks]
+            for f in as_completed(futures):
+                ret = f.result()
+                if ret != 0:
+                    logger.debug("Passive task returned code %s", ret)
 
     # combine into subs_unique.txt
     combined = outdir / "subs_raw_combined.txt"
@@ -169,56 +183,95 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
         with combined.open("w", encoding="utf-8") as fh:
             for path in (sf_out, af_out, amass_out):
                 if path.exists():
-                    for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                        ln = ln.strip()
-                        if ln:
-                            fh.write(ln + "\n")
+                    try:
+                        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            ln = ln.strip()
+                            if ln:
+                                fh.write(ln + "\n")
+                    except Exception:
+                        logger.debug("Failed to read %s", path)
         # simple normalization and dedupe
         seen = set()
         with subs_unique.open("w", encoding="utf-8") as outfh:
-            for ln in combined.read_text(encoding="utf-8", errors="ignore").splitlines():
-                s = ln.strip().strip(".").lstrip("*.").lower()
-                if s and s not in seen:
-                    seen.add(s)
-                    outfh.write(s + "\n")
+            try:
+                for ln in combined.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    s = ln.strip().strip(".").lstrip("*.").lower()
+                    if s and s not in seen:
+                        seen.add(s)
+                        outfh.write(s + "\n")
+            except Exception:
+                logger.debug("Failed to process combined subs file: %s", combined)
         logger.info("Passive enumeration complete — subs_unique: %d entries", len(seen))
+        # Save to cache
+        cachefile.parent.mkdir(parents=True, exist_ok=True)
+        cachefile.write_text(subs_unique.read_text(encoding="utf-8"), encoding="utf-8")
     else:
         logger.info("[dry-run] would combine outputs into %s", subs_unique)
 
 
+def _run_dnsrecon_for_domain(domain: str) -> tuple[str, int, str]:
+    """Helper to run dnsrecon for a single domain and return (domain, rc, stdout)."""
+    cmd = f"dnsrecon -d {shlex.quote(domain)} -t std"
+    logger.debug("[dnsrecon] resolving: %s", domain)
+    try:
+        proc = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout = proc.stdout.decode("utf-8", errors="ignore") if proc.stdout else ""
+        stderr = proc.stderr.decode("utf-8", errors="ignore") if proc.stderr else ""
+        if proc.returncode == 0:
+            return (domain, 0, stdout)
+        else:
+            return (domain, proc.returncode, stderr or stdout)
+    except FileNotFoundError:
+        return (domain, 127, "dnsrecon not found")
+    except Exception as exc:
+        return (domain, 1, str(exc))
+
+
 def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency: int):
-    """Resolve subs_unique.txt using dnsrecon and write dnsrecon.txt with DNS info."""
+    """Resolve subs_unique.txt using dnsrecon and write dnsrecon.txt with DNS info.
+
+    This implementation parallelizes DNS resolution across domains using a
+    ThreadPoolExecutor bounded by `concurrency`.
+    """
     logger.info("Step: DNS resolution using dnsrecon")
     subs_file = indir / "subs_unique.txt" if (indir / "subs_unique.txt").exists() else indir / "subs_raw_combined.txt"
     out_file = outdir / "dnsrecon.txt"
     if not subs_file.exists():
         logger.warning("No subdomain list found at %s; skipping dnsrecon", subs_file)
         return
-    with subs_file.open("r") as f:
+    with subs_file.open("r", encoding="utf-8", errors="ignore") as f:
         domains = [line.strip() for line in f if line.strip()]
     if not domains:
         logger.warning("No domains to resolve in %s; skipping dnsrecon", subs_file)
         return
-    results = []
-    for domain in domains:
-        cmd = f"dnsrecon -d {shlex.quote(domain)} -t std"
-        logger.info(f"[dnsrecon] Resolving: {domain}")
-        if dry_run:
-            logger.info("[dry-run] %s", cmd)
-            continue
-        try:
-            proc = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode == 0:
-                results.append(proc.stdout.decode("utf-8", errors="ignore"))
-            else:
-                logger.warning("dnsrecon failed for %s: %s", domain, proc.stderr.decode("utf-8", errors="ignore"))
-        except Exception as exc:
-            logger.exception("Error running dnsrecon for %s: %s", domain, exc)
+
+    results: list[str] = []
+    if dry_run:
+        logger.info("[dry-run] would run dnsrecon for %d domains", len(domains))
+    else:
+        # run dnsrecon in parallel for domains (bounded by concurrency)
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+            futures = {ex.submit(_run_dnsrecon_for_domain, d): d for d in domains}
+            for fut in as_completed(futures):
+                domain = futures[fut]
+                try:
+                    d, rc, out = fut.result()
+                    if rc == 0:
+                        results.append(out)
+                    else:
+                        logger.warning("dnsrecon failed for %s (rc=%s): %s", d, rc, out.strip().splitlines()[0] if out else "(no output)")
+                except Exception as exc:
+                    logger.exception("dnsrecon exception for %s: %s", domain, exc)
+
     if not dry_run:
-        with out_file.open("w", encoding="utf-8") as f:
-            for res in results:
-                f.write(res + "\n")
-        logger.info("dnsrecon completed and wrote %s", out_file)
+        try:
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            with out_file.open("w", encoding="utf-8") as f:
+                for res in results:
+                    f.write(res + "\n")
+            logger.info("dnsrecon completed and wrote %s", out_file)
+        except Exception:
+            logger.exception("Failed writing dnsrecon output to %s", out_file)
     else:
         logger.info("[dry-run] would write dnsrecon output to %s", out_file)
 
@@ -236,19 +289,25 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
     # Extract hostnames from dnsrecon.txt if it exists, else use subs_unique.txt
     if dnsrecon_file.exists():
         hosts = set()
-        with dnsrecon_file.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.strip() and ("A " in line or "CNAME " in line):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        hosts.add(parts[1])
+        try:
+            with dnsrecon_file.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    ln = line.strip()
+                    if not ln:
+                        continue
+                    # heuristics: look for tokens like 'A ' or 'CNAME '
+                    if "A " in ln or "CNAME " in ln:
+                        parts = ln.split()
+                        if len(parts) >= 2:
+                            hosts.add(parts[1])
+        except Exception:
+            logger.debug("Failed to parse dnsrecon output for hosts")
         if not hosts:
             logger.warning("No hosts found in dnsrecon.txt; falling back to subs_unique.txt")
             src = subs_file
         else:
-            # Write hosts to a temp file for httpx input
             temp_hosts = outdir / "hosts_for_httpx.txt"
-            temp_hosts.write_text("\n".join(hosts), encoding="utf-8")
+            temp_hosts.write_text("\n".join(sorted(hosts)), encoding="utf-8")
             src = temp_hosts
     else:
         src = subs_file
@@ -256,11 +315,11 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
         logger.warning("No source for httpx found (%s); skipping", src)
         return
     # prefer json output if available
-    cmd = f"cat {src} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -json -o {httpx_out_json}"
+    cmd = f"cat {shlex.quote(str(src))} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -json -o {shlex.quote(str(httpx_out_json))}"
     rc = safe_run(cmd, dry_run=dry_run)
     if rc != 0:
         logger.info("httpx json path failed or not supported; falling back to text output")
-        cmd2 = f"cat {src} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -o {httpx_out_txt}"
+        cmd2 = f"cat {shlex.quote(str(src))} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -o {shlex.quote(str(httpx_out_txt))}"
         safe_run(cmd2, dry_run=dry_run)
     else:
         logger.info("httpx json output written to %s", httpx_out_json)
@@ -279,16 +338,21 @@ def step_naabu(outdir: Path, dry_run: bool, concurrency: int, rate: int = 1000):
         return
     # extract IPs (best-effort: tokens that look like IPs)
     ips = set()
-    for ln in dnsrecon_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-        for token in ln.split():
-            if token.count(".") == 3:
-                ips.add(token.strip(","))
+    try:
+        txt = dnsrecon_file.read_text(encoding="utf-8", errors="ignore")
+        for ln in txt.splitlines():
+            for token in ln.split():
+                t = token.strip().strip(',')
+                if t.count('.') == 3 and all(p.isdigit() and 0 <= int(p) <= 255 for p in t.split('.')):
+                    ips.add(t)
+    except Exception:
+        logger.debug("Failed to extract IPs from dnsrecon output")
     if not ips:
         logger.warning("No IPs found in dnsrecon output; skipping naabu")
         return
     ips_list_file = outdir / "ips_for_naabu.txt"
     ips_list_file.write_text("\n".join(sorted(ips)), encoding="utf-8")
-    cmd = f"cat {ips_list_file} | {TOOLS['naabu']} -silent -rate {rate} -o {naabu_out}"
+    cmd = f"cat {shlex.quote(str(ips_list_file))} | {TOOLS['naabu']} -silent -rate {rate} -o {shlex.quote(str(naabu_out))}"
     rc = safe_run(cmd, dry_run=dry_run)
     if rc == 0:
         logger.info("naabu output written to %s", naabu_out)
@@ -307,18 +371,15 @@ def step_nuclei(outdir: Path, dry_run: bool, concurrency: int, templates: str | 
         return
     # choose input list
     if httpx_json.exists():
-        # nuclei accepts stdin of urls
-        cmd = f"cat {httpx_json} | jq -r '.url' | {TOOLS['nuclei']} -json -o {nuclei_out}"
-        # try to use jq; check if available
+        cmd = f"cat {shlex.quote(str(httpx_json))} | jq -r '.url' | {TOOLS['nuclei']} -json -o {shlex.quote(str(nuclei_out))}"
         if not which("jq"):
-            # fallback: transform manually - simpler to use httpx.txt if present
             if httpx_txt.exists():
-                cmd = f"cat {httpx_txt} | cut -d ' ' -f1 | {TOOLS['nuclei']} -json -o {nuclei_out}"
+                cmd = f"cat {shlex.quote(str(httpx_txt))} | cut -d ' ' -f1 | {TOOLS['nuclei']} -json -o {shlex.quote(str(nuclei_out))}"
             else:
                 logger.warning("jq not present and httpx txt not found; skipping nuclei")
                 return
     elif httpx_txt.exists():
-        cmd = f"cat {httpx_txt} | cut -d ' ' -f1 | {TOOLS['nuclei']} -json -o {nuclei_out}"
+        cmd = f"cat {shlex.quote(str(httpx_txt))} | cut -d ' ' -f1 | {TOOLS['nuclei']} -json -o {shlex.quote(str(nuclei_out))}"
     else:
         logger.warning("No httpx outputs found; skipping nuclei")
         return
@@ -339,10 +400,10 @@ def step_wayback(outdir: Path, dry_run: bool):
     gau_out = outdir / "gau.txt"
     if subs_file.exists():
         if which(TOOLS["waybackurls"]):
-            cmd = f"cat {subs_file} | {TOOLS['waybackurls']} > {wb_out}"
+            cmd = f"cat {shlex.quote(str(subs_file))} | {TOOLS['waybackurls']} > {shlex.quote(str(wb_out))}"
             safe_run(cmd, dry_run=dry_run)
         if which(TOOLS["gau"]):
-            cmd2 = f"cat {subs_file} | {TOOLS['gau']} > {gau_out}"
+            cmd2 = f"cat {shlex.quote(str(subs_file))} | {TOOLS['gau']} > {shlex.quote(str(gau_out))}"
             safe_run(cmd2, dry_run=dry_run)
     else:
         logger.warning("subs_unique.txt missing; skipping wayback/gau")
@@ -358,17 +419,16 @@ def step_deep_extra(outdir: Path, dry_run: bool):
     # example: run hakrawler for each host (best-effort; careful with rate)
     if which(TOOLS["hakrawler"]):
         hak_out = outdir / "hakrawler.txt"
-        cmd = f"cat {subs_file} | xargs -n1 -P5 -I{{}} {TOOLS['hakrawler']} -u https://{{}} -plain >> {hak_out}"
+        cmd = f"cat {shlex.quote(str(subs_file))} | xargs -n1 -P5 -I{{}} {TOOLS['hakrawler']} -u https://{{}} -plain >> {shlex.quote(str(hak_out))}"
         safe_run(cmd, dry_run=dry_run)
     if which(TOOLS["katana"]):
         kat_out = outdir / "katana.txt"
-        cmd = f"cat {subs_file} | xargs -n1 -P2 -I{{}} {TOOLS['katana']} -u https://{{}} -o {kat_out}"
+        cmd = f"cat {shlex.quote(str(subs_file))} | xargs -n1 -P2 -I{{}} {TOOLS['katana']} -u https://{{}} -o {shlex.quote(str(kat_out))}"
         safe_run(cmd, dry_run=dry_run)
     # paramspider (example)
     if which(TOOLS["paramspider"]):
         para_out = outdir / "paramspider.txt"
-        cmd = f"python3 {TOOLS['paramspider']} -d {shlex.quote(outdir.name)} -o {para_out}"
-        # paramspider usage varies; this is a placeholder
+        cmd = f"python3 {shlex.quote(TOOLS['paramspider'])} -d {shlex.quote(outdir.name)} -o {shlex.quote(str(para_out))}"
         safe_run(cmd, dry_run=dry_run)
 
 
@@ -376,13 +436,14 @@ def step_deep_extra(outdir: Path, dry_run: bool):
 # Export to JSON (LLM-ready)
 # ---------------------------
 
+
 def call_export_script(indir: Path, outpath: Path, target: str, dry_run: bool):
     """If export_to_json.py exists in repo, call it to create report_input.json"""
     script = Path("export_to_json.py")
     if not script.exists():
         logger.warning("export_to_json.py not found in repo; skipping LLM export")
         return
-    cmd = f"python3 {script} --indir {shlex.quote(str(indir))} --out {shlex.quote(str(outpath))} --target {shlex.quote(target)} --max-juicy {DEFAULT_MAX_JUICY}"
+    cmd = f"python3 {shlex.quote(str(script))} --indir {shlex.quote(str(indir))} --out {shlex.quote(str(outpath))} --target {shlex.quote(target)} --max-juicy {DEFAULT_MAX_JUICY}"
     rc = safe_run(cmd, dry_run=dry_run)
     if rc == 0:
         logger.info("LLM-ready JSON written to %s", outpath)
@@ -393,6 +454,7 @@ def call_export_script(indir: Path, outpath: Path, target: str, dry_run: bool):
 # ---------------------------
 # Safety and auth
 # ---------------------------
+
 
 def check_authorization(target: str, auth_file: Path | None, confirm_owned: bool, aggressive: bool) -> bool:
     """Perform simple safety checks before running the pipeline."""
@@ -420,14 +482,14 @@ def check_authorization(target: str, auth_file: Path | None, confirm_owned: bool
     return False
 
 
-
 # ---------------------------
 # Main orchestration
 # ---------------------------
 
-def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool, concurrency: int, confirm_owned: bool, auth_file: Path | None, export_llm: bool):
+
+def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool, concurrency: int, confirm_owned: bool, auth_file: Path | None, export_llm: bool, use_cache: bool = False, refresh_cache: bool = False):
     logger.info("Starting reconciliation run for %s", target)
-    run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_out = outdir / run_id
     if not dry_run:
         run_out.mkdir(parents=True, exist_ok=True)
@@ -436,7 +498,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
     run_meta = {
         "target": target,
         "run_id": run_id,
-        "started_at": datetime.now(UTC).isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "fast": fast,
         "deep": deep,
         "tools_checked": {},
@@ -455,31 +517,60 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
 
     # --- Periodic status update thread ---
     stop_event = threading.Event()
+
     def status_updater():
         while not stop_event.is_set():
-            logger.info("Recon is still running... (%s)", datetime.now(UTC).strftime("%H:%M:%S"))
+            logger.info("Recon is still running... (%s)", datetime.now(timezone.utc).strftime("%H:%M:%S"))
             stop_event.wait(20)
+
     status_thread = threading.Thread(target=status_updater, daemon=True)
     status_thread.start()
 
     # Steps
+
     try:
-        step_subdomain_passive(target=target, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        step_resolve_dnsrecon(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        step_httpx(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        step_naabu(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        # optional wayback
-        step_wayback(outdir=run_out, dry_run=dry_run)
-        # fast nuclei run
-        step_nuclei(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
-        # deep extras
-        if deep:
-            step_deep_extra(outdir=run_out, dry_run=dry_run)
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            # 1) passive subdomain enumeration
+            fut_subs = ex.submit(step_subdomain_passive, target, run_out, dry_run, concurrency, use_cache, refresh_cache)
+            # 2) DNS resolution (waits for subs_unique.txt)
+            def dns_step():
+                fut_subs.result()  # Wait for subdomain step to finish
+                step_resolve_dnsrecon(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+            fut_dns = ex.submit(dns_step)
+            # 3) httpx probing (waits for DNS step)
+            def httpx_step():
+                fut_dns.result()  # Wait for DNS step to finish
+                step_httpx(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+            fut_httpx = ex.submit(httpx_step)
+
+            # 4) run independent heavy steps concurrently after httpx is done
+            def after_httpx():
+                fut_httpx.result()
+                with ThreadPoolExecutor(max_workers=4) as ex2:
+                    futures = {}
+                    futures[ex2.submit(step_naabu, run_out, dry_run, concurrency)] = "naabu"
+                    futures[ex2.submit(step_wayback, run_out, dry_run)] = "wayback"
+                    futures[ex2.submit(step_nuclei, run_out, dry_run, concurrency)] = "nuclei"
+                    if deep:
+                        futures[ex2.submit(step_deep_extra, run_out, dry_run)] = "deep"
+                    for fut in as_completed(futures):
+                        name = futures[fut]
+                        try:
+                            fut.result()
+                            logger.info("Step %s finished", name)
+                        except Exception:
+                            logger.exception("Step %s failed", name)
+            fut_after = ex.submit(after_httpx)
+            fut_after.result()
+
         # write run_meta
-        run_meta["finished_at"] = datetime.now(UTC).isoformat()
+        run_meta["finished_at"] = datetime.now(timezone.utc).isoformat()
         if not dry_run:
-            (run_out / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
-            logger.info("Run meta written to %s", run_out / "run_meta.json")
+            try:
+                (run_out / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+                logger.info("Run meta written to %s", run_out / "run_meta.json")
+            except Exception:
+                logger.exception("Failed to write run_meta.json")
         else:
             logger.info("[dry-run] run meta would be written to %s", run_out / "run_meta.json")
 
@@ -502,6 +593,7 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
 # CLI
 # ---------------------------
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="Recon orchestration script (python replacement for recon.sh)")
     p.add_argument("--target", required=True, help="Target root domain (e.g., example.com)")
@@ -513,6 +605,8 @@ def parse_args():
     p.add_argument("--confirm-owned", action="store_true", help="Confirm you own the target (bypass AUTH_TARGETS check)")
     p.add_argument("--auth-file", type=str, default="AUTH_TARGETS", help="Path to AUTH_TARGETS file listing allowed domains (one per line)")
     p.add_argument("--export-llm", action="store_true", help="Call export_to_json.py at the end to produce LLM-ready JSON if available")
+    p.add_argument("--use-cache", action="store_true", help="Use cached results for steps if available")
+    p.add_argument("--refresh-cache", action="store_true", help="Force refresh of cache for all steps")
     return p.parse_args()
 
 
@@ -533,6 +627,8 @@ def main():
         confirm_owned=args.confirm_owned,
         auth_file=auth_file,
         export_llm=args.export_llm,
+        use_cache=args.use_cache,
+        refresh_cache=args.refresh_cache,
     )
 
 
