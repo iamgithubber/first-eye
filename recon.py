@@ -134,6 +134,38 @@ def safe_run(cmd: str, cwd: Path | None = None, out_path: Path | None = None, dr
 
 
 def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency: int, use_cache: bool = False, refresh_cache: bool = False):
+    amass_out = outdir / "amass_passive.txt"
+    def extract_fqdns_from_amass(amass_path: Path, output_path: Path):
+        """Extract FQDNs from amass_passive.txt and save to output_path."""
+        try:
+            if not amass_path.exists():
+                logger.warning(f"amass output {amass_path} does not exist; skipping FQDN extraction.")
+                return
+            fqdns = set()
+            with amass_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.split(" (FQDN)")
+                    if parts and '-->' in parts[0]:
+                        fqdn = parts[0].split('-->')[0].strip()
+                        if fqdn:
+                            fqdns.add(fqdn)
+            if fqdns:
+                with output_path.open("w", encoding="utf-8") as out:
+                    for fqdn in sorted(fqdns):
+                        out.write(fqdn + "\n")
+                logger.info(f"Extracted {len(fqdns)} FQDNs from amass output to {output_path}")
+            else:
+                logger.warning(f"No FQDNs found in {amass_path}")
+        except Exception as exc:
+            logger.error(f"Error extracting FQDNs from amass: {exc}")
+    # After amass completes, extract FQDNs for other tools if amass_out exists
+    try:
+        if amass_out.exists():
+            extract_fqdns_from_amass(amass_out, outdir / "subs_from_amass.txt")
+        else:
+            logger.info(f"amass output {amass_out} does not exist, skipping FQDN extraction.")
+    except Exception as exc:
+        logger.error(f"Error in FQDN extraction step: {exc}")
     """Run subfinder, assetfinder, amass (passive) and combine outputs."""
     logger.info("Step: passive subdomain enumeration for %s", target)
     cachefile = cache_path(target, outdir, "subs_unique")
@@ -194,10 +226,26 @@ def step_subdomain_passive(target: str, outdir: Path, dry_run: bool, concurrency
         futures = []
         for cmd, out in tasks:
             logger.info(f"[Passive] Starting: {cmd}")
-            futures.append(ex.submit(safe_run, cmd, None, out, dry_run))
-        futures.append(ex.submit(run_amass_watcher))
+            def run_tool(cmd=cmd, out=out):
+                try:
+                    return safe_run(cmd, None, out, dry_run)
+                except Exception as exc:
+                    logger.error(f"Error running {cmd}: {exc}")
+                    return 1
+            futures.append(ex.submit(run_tool))
+        def run_amass_safe():
+            try:
+                return run_amass_watcher()
+            except Exception as exc:
+                logger.error(f"Error running amass: {exc}")
+                return 1
+        futures.append(ex.submit(run_amass_safe))
         for i, f in enumerate(as_completed(futures)):
-            ret = f.result()
+            try:
+                ret = f.result()
+            except Exception as exc:
+                logger.error(f"Passive tool future failed: {exc}")
+                ret = 1
             if i < len(tasks):
                 step_name = tasks[i][0].split()[0]
             else:
@@ -269,17 +317,29 @@ def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency:
     out_file = outdir / "dnsrecon.txt"
     if not subs_file.exists():
         logger.warning("No subdomain list found at %s; skipping dnsrecon", subs_file)
+        # Always create empty output for downstream steps
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text("")
         return
     with subs_file.open("r", encoding="utf-8", errors="ignore") as f:
         domains = [line.strip() for line in f if line.strip()]
     if not domains:
         logger.warning("No domains to resolve in %s; skipping dnsrecon", subs_file)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text("")
         return
 
     results: list[str] = []
     if dry_run:
         logger.info("[dry-run] would run dnsrecon for %d domains", len(domains))
     else:
+        # Check if dnsrecon is available before running
+        if not shutil.which(TOOLS["dnsrecon"]):
+            logger.warning("dnsrecon not found in PATH; skipping DNS resolution for all domains.")
+            # Create empty output for downstream steps
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text("")
+            return
         logger.info("[dnsrecon] Starting DNS resolution for %d domains", len(domains))
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
             futures = {ex.submit(_run_dnsrecon_for_domain, d): d for d in domains}
@@ -290,6 +350,9 @@ def step_resolve_dnsrecon(indir: Path, outdir: Path, dry_run: bool, concurrency:
                     if rc == 0:
                         logger.info("[dnsrecon] Success for %s", d)
                         results.append(out)
+                    elif rc == 127 and out.strip() == "dnsrecon not found":
+                        # Already handled above, skip repetitive warning
+                        continue
                     else:
                         logger.warning("[dnsrecon] Failed for %s (rc=%s): %s", d, rc, out.strip().splitlines()[0] if out else "(no output)")
                 except Exception as exc:
@@ -317,6 +380,17 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
     httpx_out_json = outdir / "httpx.json"
     if not which(TOOLS["httpx"]):
         logger.warning("httpx not found; skipping httpx")
+        # Always create empty outputs for downstream steps
+        httpx_out_txt.parent.mkdir(parents=True, exist_ok=True)
+        httpx_out_txt.write_text("")
+        httpx_out_json.write_text("")
+        return
+    # Check if subs_unique.txt exists and is not empty
+    if not subs_file.exists() or subs_file.stat().st_size == 0:
+        logger.warning("subs_unique.txt missing or empty; skipping httpx step")
+        httpx_out_txt.parent.mkdir(parents=True, exist_ok=True)
+        httpx_out_txt.write_text("")
+        httpx_out_json.write_text("")
         return
     # Extract hostnames from dnsrecon.txt if it exists, else use subs_unique.txt
     if dnsrecon_file.exists():
@@ -343,8 +417,11 @@ def step_httpx(outdir: Path, dry_run: bool, concurrency: int):
             src = temp_hosts
     else:
         src = subs_file
-    if not src.exists():
-        logger.warning("No source for httpx found (%s); skipping", src)
+    if not src.exists() or src.stat().st_size == 0:
+        logger.warning("No valid input for httpx found (%s); skipping", src)
+        httpx_out_txt.parent.mkdir(parents=True, exist_ok=True)
+        httpx_out_txt.write_text("")
+        httpx_out_json.write_text("")
         return
     # prefer json output if available
     cmd = f"cat {shlex.quote(str(src))} | {TOOLS['httpx']} -silent -status-code -title -tech-detect -json -o {shlex.quote(str(httpx_out_json))}"
@@ -571,36 +648,40 @@ def orchestrate(target: str, outdir: Path, fast: bool, deep: bool, dry_run: bool
 
     try:
         with ThreadPoolExecutor(max_workers=3) as ex:
-            # 1) passive subdomain enumeration
             fut_subs = ex.submit(step_subdomain_passive, target, run_out, dry_run, concurrency, use_cache, refresh_cache)
-            # 2) DNS resolution (waits for subs_unique.txt)
             def dns_step():
-                fut_subs.result()  # Wait for subdomain step to finish
-                step_resolve_dnsrecon(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+                try:
+                    fut_subs.result()
+                    step_resolve_dnsrecon(indir=run_out, outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+                except Exception as e:
+                    logger.exception("Error in DNS step: %s", e)
             fut_dns = ex.submit(dns_step)
-            # 3) httpx probing (waits for DNS step)
             def httpx_step():
-                fut_dns.result()  # Wait for DNS step to finish
-                step_httpx(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+                try:
+                    fut_dns.result()
+                    step_httpx(outdir=run_out, dry_run=dry_run, concurrency=concurrency)
+                except Exception as e:
+                    logger.exception("Error in HTTPX step: %s", e)
             fut_httpx = ex.submit(httpx_step)
-
-            # 4) run independent heavy steps concurrently after httpx is done
             def after_httpx():
-                fut_httpx.result()
-                with ThreadPoolExecutor(max_workers=4) as ex2:
-                    futures = {}
-                    futures[ex2.submit(step_naabu, run_out, dry_run, concurrency)] = "naabu"
-                    futures[ex2.submit(step_wayback, run_out, dry_run)] = "wayback"
-                    futures[ex2.submit(step_nuclei, run_out, dry_run, concurrency)] = "nuclei"
-                    if deep:
-                        futures[ex2.submit(step_deep_extra, run_out, dry_run)] = "deep"
-                    for fut in as_completed(futures):
-                        name = futures[fut]
-                        try:
-                            fut.result()
-                            logger.info("Step %s finished", name)
-                        except Exception:
-                            logger.exception("Step %s failed", name)
+                try:
+                    fut_httpx.result()
+                    with ThreadPoolExecutor(max_workers=4) as ex2:
+                        futures = {}
+                        futures[ex2.submit(step_naabu, run_out, dry_run, concurrency)] = "naabu"
+                        futures[ex2.submit(step_wayback, run_out, dry_run)] = "wayback"
+                        futures[ex2.submit(step_nuclei, run_out, dry_run, concurrency)] = "nuclei"
+                        if deep:
+                            futures[ex2.submit(step_deep_extra, run_out, dry_run)] = "deep"
+                        for fut in as_completed(futures):
+                            name = futures[fut]
+                            try:
+                                fut.result()
+                                logger.info("Step %s finished", name)
+                            except Exception:
+                                logger.exception("Step %s failed", name)
+                except Exception as e:
+                    logger.exception("Error in after_httpx orchestration: %s", e)
             fut_after = ex.submit(after_httpx)
             fut_after.result()
 
